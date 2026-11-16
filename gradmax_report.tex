@@ -1,0 +1,294 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!30},
+  backgroundcolor=\color{black!3},
+  columns=fullflexible,
+  keepspaces=true
+}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1\right\rVert}
+
+\title{GradMax with Automatic Growth Tuning in TensorFlow\\[2pt]
+\large Design, Mathematics, Implementation and Deployment to TensorFlow Lite}
+\author{Vishwas N\\ M.Tech, Department of Electronics and Communication Engineering, MSRIT}
+\date{16 November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+GradMax grows a neural network during training by adding neurons that leave the network function unchanged at the moment of growth and whose initial weights are chosen, through a singular value decomposition (SVD), to maximize the gradient norm of the new parameters. This report describes a TensorFlow implementation of that idea for multi-layer perceptrons (MLPs), together with an automatic tuning layer that decides when, where and by how much to grow, and when to stop. The trained model is exported to Keras, SavedModel, pickle and TensorFlow Lite (TFLite) formats. The report also summarizes the theoretical limits of learning (bias--variance decomposition, the No Free Lunch theorem and the VC generalization bound) that motivate the stopping rule. \emph{Status:} the code compiles, but it has not yet been executed because TensorFlow was unavailable in the build environment. No accuracy, FLOP or latency results are reported; Section~\ref{sec:eval} gives the protocol for obtaining them.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%--------------------------------------------------------------------
+\section{Introduction}
+Choosing the width of a network before training is a guess. A network that is too small underfits; one that is too large wastes compute and memory, which matters on edge devices. Training several sizes from scratch is expensive. Growing methods start from a small seed network and add capacity while training. The difficulty is doing so without disturbing what the network has already learned, and without adding neurons that stay useless.
+
+GradMax (Evci et al., 2022) addresses both points. Its two ingredients are:
+\begin{enumerate}[nosep]
+  \item \textbf{Function preservation.} New neurons are added with weights that make the network output identical before and after growth.
+  \item \textbf{Gradient-maximizing initialization.} The remaining free weights of the new neurons are set, via an SVD, so that the gradient norm on the new parameters is as large as possible, which lets them learn quickly.
+\end{enumerate}
+The original work reports that this matches training the large network from scratch with fewer training FLOPs on MLPs and convolutional networks; this report does not reproduce those claims, and the figures should be checked against the paper.
+
+This work adds an \emph{auto-tuning} layer so that no growth schedule has to be set by hand, and a deployment path to TensorFlow Lite.
+
+\paragraph{Contributions of the accompanying code.}
+\begin{itemize}[nosep]
+  \item GradMax growth for fully connected layers in TensorFlow 2 / Keras, with the SVD step in NumPy.
+  \item Four automatic decisions: growth trigger, growth location, initialization scale and stopping.
+  \item Export to \code{.pkl}, \code{.keras}, SavedModel, \code{.h5} and \code{.tflite} (none, dynamic, fp16 and int8 quantization), with accuracy re-measured on the TFLite file.
+  \item A self-test for the two properties GradMax relies on.
+\end{itemize}
+
+%--------------------------------------------------------------------
+\section{Mathematical Background}
+\subsection{Notation}
+Consider an MLP with layers $\ell = 1,\dots,L$. Layer $\ell$ computes
+\[
+z_\ell = a_{\ell-1} W_\ell + b_\ell, \qquad a_\ell = \phi(z_\ell),
+\]
+with $a_0 = x$, $W_\ell \in \R^{n_{\ell-1}\times n_\ell}$, $\phi=\mathrm{ReLU}$ for hidden layers and the identity for the output layer. Let $\mathcal{L}$ be the mean cross-entropy loss over a batch of size $B$, and define the back-propagated signal
+\[
+\delta_{\ell} = \frac{\partial \mathcal{L}}{\partial z_\ell} \in \R^{B\times n_\ell}.
+\]
+We grow hidden layer $\ell$ by $k$ neurons. Its incoming weights gain $k$ new columns $W^{\mathrm{in}}\in\R^{n_{\ell-1}\times k}$ and its outgoing weights gain $k$ new rows $W^{\mathrm{out}}\in\R^{k\times n_{\ell+1}}$.
+
+\subsection{Function preservation}
+With the new neurons present, the next layer's pre-activation becomes
+\[
+z_{\ell+1}' = z_{\ell+1} + \phi\!\left(a_{\ell-1}W^{\mathrm{in}} + b^{\mathrm{new}}\right) W^{\mathrm{out}}.
+\]
+Setting $W^{\mathrm{out}}=0$ and $b^{\mathrm{new}}=0$ gives $z_{\ell+1}'=z_{\ell+1}$ for every input, so the network output is unchanged exactly at the moment of growth, for any choice of $W^{\mathrm{in}}$. This leaves $W^{\mathrm{in}}$ free to be chosen for a different purpose.
+
+\subsection{Why the gradient norm matters}
+With $W^{\mathrm{out}}=0$, the gradient of the loss with respect to $W^{\mathrm{out}}$ is
+\begin{equation}
+\frac{\partial \mathcal{L}}{\partial W^{\mathrm{out}}}
+= \phi\!\left(a_{\ell-1}W^{\mathrm{in}}\right)^{\!\top}\delta_{\ell+1}.
+\label{eq:gradout}
+\end{equation}
+It is the only first-order signal that can move the new neurons, because the gradient with respect to $W^{\mathrm{in}}$ is proportional to $W^{\mathrm{out}}=0$. A larger norm of~\eqref{eq:gradout} means faster initial progress of the new neurons, so $W^{\mathrm{in}}$ should be chosen to make it large.
+
+\subsection{SVD solution}
+Treating the activation as locally linear around the new neurons' pre-activations, \eqref{eq:gradout} becomes $(W^{\mathrm{in}})^{\top} a_{\ell-1}^{\top}\delta_{\ell+1}$. Define the cross-covariance
+\begin{equation}
+\Sigma_\ell = a_{\ell-1}^{\top}\,\delta_{\ell+1} \in \R^{n_{\ell-1}\times n_{\ell+1}},
+\qquad \Sigma_\ell = U S V^{\top}.
+\label{eq:svd}
+\end{equation}
+Maximizing $\norm{(W^{\mathrm{in}})^{\top}\Sigma_\ell}_F$ subject to a norm bound on $W^{\mathrm{in}}$ is a standard problem whose solution is the span of the top singular vectors:
+\begin{equation}
+W^{\mathrm{in}} = c\,U_{:,1:k},
+\qquad
+\max \norm{(W^{\mathrm{in}})^{\top}\Sigma_\ell}_F^{2} = c^{2}\sum_{j=1}^{k}s_j^{2},
+\label{eq:win}
+\end{equation}
+where $s_1\ge s_2\ge\cdots$ are the singular values and $c$ is a scale. The quantity $\sum_{j\le k}s_j^2$ is the \emph{gain} used later to decide where to grow.
+
+\paragraph{Remark on the roles of incoming and outgoing weights.}
+Both assignments (outgoing weights zero with SVD-chosen incoming weights, or the reverse) preserve the function, because $\mathrm{ReLU}(0)=0$. The implementation follows the form above (outgoing zero, incoming from $U$). A summary of GradMax that lists the roles the other way round was supplied while preparing this report; the exact assignment in the original paper should be confirmed against the paper before the report is used as a reference for the method.
+
+%--------------------------------------------------------------------
+\section{Automatic Growth Tuning}
+The tuning layer removes four hand-set choices.
+
+\subsection{When to grow}
+Training proceeds one epoch at a time. Growth is triggered when the validation loss has not improved by more than $\varepsilon=10^{-3}$ for $p=2$ consecutive epochs (patience), and a cooldown of 2 epochs has elapsed since the last growth. After growth the optimizer is rebuilt and the best-loss tracker is reset.
+
+\subsection{Where to grow}
+For each hidden layer the code computes $\Sigma_\ell$ on a random subset of 2048 training examples and scores it by gain per parameter:
+\[
+\mathrm{score}_\ell = \frac{\sum_{j=1}^{k}s_j^{2}}{k\,(n_{\ell-1} + 1 + n_{\ell+1})}.
+\]
+The denominator is the number of parameters added by $k$ new neurons (incoming weights, bias, outgoing weights). The layer with the highest score is grown.
+
+\subsection{How much: the scale $c$}
+The scale in \eqref{eq:win} is expressed relative to the mean column norm of the existing incoming weights. Candidates $\{0.25,0.5,1,2\}$ are each tried by building the grown model and training it for 30 mini-batches; the candidate with the lowest loss on a 2048-example probe set is kept.
+
+\subsection{When to stop}
+Growth stops when either condition holds:
+\begin{itemize}[nosep]
+  \item the parameter budget \code{--max-params} would be exceeded by the next step;
+  \item the gap between validation and training loss exceeds $0.35$.
+\end{itemize}
+The second rule is a variance proxy; Section~\ref{sec:limits} explains why added capacity can hurt once variance dominates.
+
+\begin{table}[h]
+\centering
+\caption{Summary of automatic decisions and default settings.}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Decision & Rule & Default \\
+\midrule
+Trigger & validation-loss plateau & patience 2, $\varepsilon=10^{-3}$ \\
+Cooldown & epochs between growth steps & 2 \\
+Neurons per step & $k$ & 16 \\
+Location & max gain per added parameter & -- \\
+Scale $c$ & lowest probe loss & grid $\{0.25,0.5,1,2\}$ \\
+Stop (budget) & parameter count & 200{,}000 \\
+Stop (variance) & val$-$train loss gap & 0.35 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Algorithm~\ref{alg:gm} summarizes one run.
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.92\linewidth}
+\begin{lstlisting}[mathescape=true]
+init MLP with seed width w (e.g. 32), depth d
+repeat for each epoch:
+    train one epoch; measure train/val loss
+    if val loss stalled for p epochs and cooldown over:
+        if (val - train) gap > 0.35 or budget reached: continue
+        Sigma_l = a_{l-1}^T delta_{l+1}  for each hidden layer l
+        pick layer l* maximizing  sum_j s_j^2 / (params added)
+        pick scale c by 30-step probe runs over the grid
+        W_in_new = c * U[:, :k];  W_out_new = 0;  b_new = 0
+        rebuild Keras model and optimizer
+export to .pkl / .keras / SavedModel / .h5 / .tflite
+\end{lstlisting}
+\end{minipage}
+\caption{Pseudocode of GradMax with automatic tuning.}
+\label{alg:gm}
+\end{figure}
+
+%--------------------------------------------------------------------
+\section{Implementation}
+\subsection{Structure}
+The code is a single file, \code{gradmax\_tf.py}. Parameters are held as a list of NumPy \code{(W, b)} pairs so that growth is plain array surgery; a Keras model is rebuilt from them after each growth step.
+
+\begin{table}[h]
+\centering
+\caption{Main functions.}
+\begin{tabular}{@{}lp{9.5cm}@{}}
+\toprule
+Function & Role \\
+\midrule
+\code{forward\_grads} & Forward pass under \code{GradientTape}; returns layer inputs and $\partial\mathcal{L}/\partial z_\ell$ \\
+\code{cross\_covariances} & Computes $\Sigma_\ell$ for all hidden layers \\
+\code{plan\_growth} & SVD of each $\Sigma_\ell$; selects the layer by gain per parameter \\
+\code{grow\_layer} & Appends new columns, zero bias and zero outgoing rows \\
+\code{autotune\_scale} & Probe training over the scale grid \\
+\code{train\_gradmax} & Training loop with trigger, cooldown and stopping rules \\
+\code{save\_model}, \code{load\_pickle} & Persistence in four formats and reload from pickle \\
+\code{export\_tflite}, \code{tflite\_accuracy} & TFLite conversion and accuracy on the converted file \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Usage}
+\begin{lstlisting}[language=bash]
+python gradmax_tf.py --selftest
+python gradmax_tf.py --epochs 30 --seed-width 32 --depth 2 \
+       --grow-k 16 --max-params 200000 --quant dynamic
+\end{lstlisting}
+
+\subsection{Saved artifacts}
+\begin{table}[h]
+\centering
+\caption{Files written after training (prefix \code{gradmax\_model}).}
+\begin{tabular}{@{}ll@{}}
+\toprule
+File & Content \\
+\midrule
+\code{.pkl} & NumPy weights and layer widths; \code{load\_pickle} rebuilds a compiled model \\
+\code{.keras} & Native Keras model \\
+\code{\_savedmodel/} & TensorFlow SavedModel directory for serving \\
+\code{.h5} & Legacy Keras format (skipped if the TensorFlow version rejects it) \\
+\code{.tflite} & TensorFlow Lite flatbuffer \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{TensorFlow Lite export}
+The final Keras model is converted with \code{TFLiteConverter.from\_keras\_model}. Four modes are supported: no quantization; dynamic-range quantization; float16; and full integer (int8), which uses 200 training samples as a representative dataset. The accuracy of the converted file is then re-measured with the TFLite interpreter, since quantization can change predictions.
+
+\subsection{Self-test}
+\code{--selftest} builds a small random MLP and verifies two properties: (i) the maximum absolute difference between logits before and after growth is below $10^{-5}$ (function preservation); (ii) the gradient norm on the new outgoing weights is reported for SVD initialization versus a random orthonormal initialization of the same norm, so the benefit of~\eqref{eq:win} can be inspected directly.
+
+%--------------------------------------------------------------------
+\section{Evaluation Protocol}\label{sec:eval}
+No results are claimed here. To evaluate the method, the following protocol is proposed.
+\begin{enumerate}[nosep]
+  \item Run \code{--selftest} to confirm function preservation and the gradient-norm advantage.
+  \item Train three models on the same data split and seeds: (a) a fixed small network (the seed width); (b) a fixed large network at the final grown widths, trained from scratch; (c) the grown network.
+  \item Record validation accuracy, parameter count, and training cost. Training FLOPs can be estimated from the parameter count at each epoch, since MLP cost scales with the number of weights.
+  \item Compare growth with SVD initialization to growth with random incoming weights, with all other settings equal.
+  \item For each exported TFLite variant, record file size, accuracy and on-device latency.
+\end{enumerate}
+Differences should be reported over several seeds, with spread, before drawing conclusions.
+
+%--------------------------------------------------------------------
+\section{Limits of Learning and the Stopping Rule}\label{sec:limits}
+\subsection{Bias--variance decomposition}
+For squared loss, the expected error on unseen data decomposes as
+\begin{equation}
+\mathbb{E}[\text{error}] = \mathrm{Bias}^{2} + \mathrm{Variance} + \sigma^{2},
+\end{equation}
+where $\sigma^2$ is irreducible noise. Growing a network lowers bias but tends to raise variance. The train--validation gap in Section~3.4 is a practical proxy for the variance term; when it is large, growth is halted.
+
+\subsection{No Free Lunch}
+Wolpert's theorem states that, averaged over all possible target functions $f$, any two algorithms $a_1,a_2$ have identical off-training-set performance:
+\begin{equation}
+\sum_{f} P(d_m\mid f,m,a_1) = \sum_{f} P(d_m\mid f,m,a_2).
+\end{equation}
+Consequently no growth rule, GradMax included, is universally best; its advantages must be demonstrated on the task of interest.
+
+\subsection{Generalization bound}
+With probability at least $1-\eta$, the true risk of a hypothesis $h$ from a class of VC dimension $d$, trained on $N$ samples, satisfies
+\begin{equation}
+R(h)\le R_{\mathrm{emp}}(h)+\sqrt{\frac{d\left(\ln\frac{2N}{d}+1\right)-\ln\frac{\eta}{4}}{N}}.
+\end{equation}
+The bound widens as capacity $d$ grows unless $N$ grows too, which is another reason for the budget cap on parameters.
+
+\subsection{Practical limitations}
+\begin{itemize}[nosep]
+  \item \textbf{Data dependence.} Noisy or unrepresentative data gives unreliable models, grown or not.
+  \item \textbf{Overfitting and underfitting.} Growth reduces underfitting but can cause overfitting; the gap rule mitigates this only approximately.
+  \item \textbf{Drift.} A deployed model does not adapt to changing conditions without monitoring and retraining.
+  \item \textbf{Interpretability.} The grown network remains a black box, which limits use where results must be audited.
+  \item \textbf{Correlation, not causation.} The model captures statistical patterns only.
+\end{itemize}
+
+\subsection{Limitations of this implementation}
+\begin{itemize}[nosep]
+  \item Dense layers only. Convolutional growth (Wide-ResNet, VGG, MobileNet) needs the same SVD step on unfolded patch statistics, which is not implemented.
+  \item The thresholds (patience 2, gap 0.35, $k=16$, probe length 30) are untuned defaults.
+  \item The linearization of the activation in~\eqref{eq:win} is an approximation; the self-test shows whether it pays off on a given network.
+  \item Rebuilding the Keras model at each growth step resets the optimizer state.
+\end{itemize}
+
+%--------------------------------------------------------------------
+\section{Conclusion}
+The code implements GradMax growth for MLPs in TensorFlow with an automatic policy for when, where, how much and how long to grow, and exports the result for TensorFlow, Keras and TFLite deployment. It is complete as software but unvalidated empirically. The next step is to run the self-test and the evaluation protocol of Section~\ref{sec:eval}; extending the method to convolutional layers is the natural follow-up for the MobileNet-style edge use case.
+
+%--------------------------------------------------------------------
+\begin{thebibliography}{9}
+\bibitem{gradmax} U.~Evci, B.~van Merri\"enboer, T.~Unterthiner, M.~Vladymyrov, F.~Pedregosa. \emph{GradMax: Growing Neural Networks using Gradient Information}. ICLR 2022. arXiv:2201.05125.
+\bibitem{firefly} L.~Wu, D.~Wang, Q.~Liu. \emph{Firefly Neural Architecture Descent: a General Approach for Growing Neural Networks}. NeurIPS 2020.
+\bibitem{nfl} D.~H.~Wolpert. The lack of a priori distinctions between learning algorithms. \emph{Neural Computation}, 8(7):1341--1390, 1996.
+\bibitem{vc} V.~N.~Vapnik, A.~Ya.~Chervonenkis. On the uniform convergence of relative frequencies of events to their probabilities. \emph{Theory of Probability and Its Applications}, 16(2):264--280, 1971.
+\end{thebibliography}
+
+\end{document}
